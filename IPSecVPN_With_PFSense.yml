@@ -1,0 +1,127 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: IPSecVPN Stack
+
+Parameters:
+  CustomerPublicIPAddress:
+    Type: String
+    Description: Public IP Address of the Customer Gateway
+
+  IPSecPort1:
+    Type: String
+    Default: "500"
+
+  IPSecPort2:
+    Type: String
+    Default: "4500"
+
+  IPSecProtocol:
+    Type: String
+    Default: udp
+
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC Id where PfSense will be installed
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet Id where PfSense will be installed
+
+  SSHKeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: SSH Key for the OpenVPN Instance
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair.
+
+  CustomerDestinationCidrBlock:
+    Type: String
+    Description: Customer Block CIDR
+
+  InstanceAMI:
+    Type: String
+    Description: Intance AMI to IPSec Instance
+    Default: ami-0c578794a31778880
+
+Resources:
+  IPSecEIP:
+    Type: "AWS::EC2::EIP"
+    Properties:
+      Domain: vpc
+
+  AssociateManagementAccessPort:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt IPSecEIP.AllocationId
+      NetworkInterfaceId: !Ref EC2NetworkInterface
+
+  IPSecInstanceSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG for OpenVPN Server
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: !Ref IPSecProtocol
+          FromPort: !Ref IPSecPort1
+          ToPort: !Ref IPSecPort1
+          CidrIp: !Ref CustomerDestinationCidrBlock
+        - IpProtocol: !Ref IPSecProtocol
+          FromPort: !Ref IPSecPort2
+          ToPort: !Ref IPSecPort2
+          CidrIp: !Ref CustomerDestinationCidrBlock
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref CustomerDestinationCidrBlock
+
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+        - !Ref EC2InstanceRole
+
+  EC2NetworkInterface:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId:
+        !Ref SubnetId
+      Description: Public Interface
+      GroupSet:
+      - !Ref IPSecInstanceSG
+      SourceDestCheck: false
+      Tags:
+        -
+          Key: Name
+          Value: IPSec ENI
+  
+  EC2IPSecInstance:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      ImageId: !Ref InstanceAMI
+      InstanceType: t2.micro
+      SourceDestCheck: false
+      KeyName: !Ref SSHKeyName
+      NetworkInterfaces:
+        - NetworkInterfaceId: !Ref EC2NetworkInterface
+          DeviceIndex: "0"
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      Tags:
+        -
+          Key: Name
+          Value: IPSecVPN
+    CreationPolicy:
+      ResourceSignal:
+        Count: "1"
+        Timeout: PT10M
