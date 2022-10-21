@@ -1,0 +1,22 @@
+version: 0.2
+env:
+  parameter-store:
+    DEPLOY_BUCKET: /ECS-CLUSTER/mg-test/mg-frontend-codepipeline/AWS_S3
+    DISTRIBUTION_ID: "/ECS-CLUSTER/${ClusterName}/${ProjectName}/DISTRIBUTION_ID"
+phases:
+  install:
+    runtime-versions:
+      nodejs: 14
+  pre_build:
+    commands:
+      - cd $CODEBUILD_SRC_DIR_App
+      - npm install
+  build:
+    commands:
+      - echo Build started on `date`
+      - npm run build
+  post_build:
+    commands:
+    - aws s3 sync --acl public-read ./${BuildFolder} s3://$DEPLOY_BUCKET/
+    - aws cloudfront create-invalidation --distribution-id $DISTRIBUTION_ID --paths /index.html /fonts/* /js/* /css/* /favicon.ico
+    

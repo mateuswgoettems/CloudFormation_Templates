@@ -1,0 +1,368 @@
+Parameters:
+  GitHubRepo:
+    Type: String
+
+  GitHubBranch:
+    Type: String
+
+  GitHubToken:
+    Type: String
+    NoEcho: true
+
+  GitHubOwner:
+    Type: String 
+
+  StackName:
+    Type: String
+
+  PropertiesName:
+    Type: String
+
+######## Cluster parameters ########
+
+  ClusterName:
+    Type: String
+    Default: mg-infra
+
+  ClusterStackName:
+    Type: String
+
+  DefaultAcmCertificateArn:
+    Type: String
+
+  DBInstanceType:
+    Type: String
+    
+  DBSnapshotName:
+    Type: String
+    Default: WITHOUT
+
+  DBHasAutomaticBackup:
+    Type: String
+    Default: true
+
+  HostedZoneName:
+    Type: String
+
+  CidrIp:
+    Type: String
+    
+  ECSInstanceTypeWeb:
+    Type: String
+
+  KeyName:
+    Type: String
+
+  AsgServiceMinWeb:
+    Type: String
+    Default: 1
+
+  AsgServiceMaxWeb:
+    Type: String
+    Default: 2
+
+  AsgServiceDesiredWeb:
+    Type: String
+    Default: 2
+
+  S3Bucket:
+    Type: String
+
+  EcsImage:
+    Type: String
+
+  TypeProject:
+    Type: String
+    Default: s3upload
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Label:
+        default: Cluster General Params
+      Parameters:
+        - ClusterStackName
+        - HostedZoneName
+        - ClusterName
+
+    - Label:
+        default: Cluster ELB Params
+      Parameters:
+        - DefaultAcmCertificateArn
+
+    - Label:
+        default: Cluster RDS Params
+      Parameters:
+        - DBInstanceType
+        - DBSnapshotName
+        - DBHasAutomaticBackup
+        - CidrIp
+
+    - Label:
+        default: Cluster ECS Params
+      Parameters:
+        - ECSInstanceTypeWeb
+        - KeyName
+        - AsgServiceMinWeb
+        - AsgServiceMaxWeb
+        - AsgServiceDesiredWeb
+        - S3Bucket
+        - EcsImage
+        - TypeProject
+        
+Resources:
+  CloudFormationExecutionRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Retain
+    Properties:
+      RoleName: !Sub cfn-${ClusterName}-role
+      Path: /
+      AssumeRolePolicyDocument: |
+        {
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Service": [ "cloudformation.amazonaws.com" ]},
+                "Action": [ "sts:AssumeRole" ]
+            }]
+        }
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - ecs:*
+                  - ecr:*
+                  - iam:*
+                  - DevOpslication-autoscaling:*
+                  - ec2:*
+                  - elasticloadbalancing:*
+                  - ssm:*
+                  - route53:*
+                  - cloudwatch:*
+                  - events:*
+                  - secretsmanager:*
+                  - autoscaling:*
+                  - rds:*
+                  - elasticache:*
+                  - logs:*
+                  - servicediscovery:*
+
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub cp-${ClusterName}-role
+      Path: /
+      AssumeRolePolicyDocument: |
+        {
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Service": [ "codepipeline.amazonaws.com" ]},
+                "Action": [ "sts:AssumeRole" ]
+            }]
+        }
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource:
+                  - !Sub arn:aws:s3:::*
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                  - cloudformation:*
+                  - cloudwatch:*
+                  - events:*
+                  - iam:PassRole
+                  - secretsmanager:*
+                  - ec2:*
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties: 
+      BucketName: !Ref PropertiesName
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Ref PropertiesName
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: DevOps
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Version: 1
+                Provider: GitHub
+              Configuration:
+                Owner: !Sub "${GitHubOwner}"
+                Repo: !Ref GitHubRepo 
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Ref GitHubToken
+              OutputArtifacts:
+                - Name: DevOps
+              RunOrder: 1
+        - Name: ClusterDeploy
+          Actions:
+            - Name: CreateVPCChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CloudFormation
+              Configuration:
+                ChangeSetName: Deploy
+                ActionMode: CHANGE_SET_REPLACE
+                StackName: !Sub ${ClusterStackName}-vpc
+                Capabilities: CAPABILITY_NAMED_IAM
+                TemplatePath: !Sub DevOps::infra/vpc.yml
+                RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+                ParameterOverrides: !Sub |
+                  {
+                    "ClusterName": "${ClusterName}"
+                  }
+              RunOrder: 1
+              InputArtifacts:
+                - Name: DevOps
+            - Name: ExecuteVPCChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CloudFormation
+              Configuration:
+                ChangeSetName: Deploy
+                ActionMode: CHANGE_SET_EXECUTE
+                StackName: !Sub ${ClusterStackName}-vpc
+                RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+              RunOrder: 2
+            - Name: CreateELBChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CloudFormation
+              Configuration:
+                ChangeSetName: Deploy
+                ActionMode: CHANGE_SET_REPLACE
+                StackName: !Sub ${ClusterStackName}-elb
+                Capabilities: CAPABILITY_NAMED_IAM
+                TemplatePath: !Sub DevOps::infra/elb.yml
+                RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+                ParameterOverrides: !Sub |
+                  {
+                    "ClusterName": "${ClusterName}",
+                    "DefaultAcmCertificateArn": "${DefaultAcmCertificateArn}"
+                  }
+              RunOrder: 3
+              InputArtifacts:
+                - Name: DevOps
+            - Name: ExecuteELBChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CloudFormation
+              Configuration:
+                ChangeSetName: Deploy
+                ActionMode: CHANGE_SET_EXECUTE
+                StackName: !Sub ${ClusterStackName}-elb
+                RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+              RunOrder: 4
+            - Name: CreateRDSChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CloudFormation
+              Configuration:
+                ChangeSetName: Deploy
+                ActionMode: CHANGE_SET_REPLACE
+                StackName: !Sub ${ClusterStackName}-rds
+                Capabilities: CAPABILITY_NAMED_IAM
+                TemplatePath: !Sub DevOps::infra/rds.yml
+                RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+                ParameterOverrides: !Sub |
+                  {
+                    "ClusterName": "${ClusterName}",
+                    "DBInstanceType": "${DBInstanceType}",
+                    "DBSnapshotName": "${DBSnapshotName}",
+                    "DBHasAutomaticBackup": "${DBHasAutomaticBackup}",
+                    "HostedZoneName": "${HostedZoneName}",
+                    "CidrIp": "${CidrIp}"
+                  }
+              RunOrder: 5
+              InputArtifacts:
+                - Name: DevOps
+            - Name: ExecuteRDSChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CloudFormation
+              Configuration:
+                ChangeSetName: Deploy
+                ActionMode: CHANGE_SET_EXECUTE
+                StackName: !Sub ${ClusterStackName}-rds
+                RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+              RunOrder: 6
+            - Name: CreateECSChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CloudFormation
+              Configuration:
+                ChangeSetName: Deploy
+                ActionMode: CHANGE_SET_REPLACE
+                StackName: !Sub ${ClusterStackName}-ecs
+                Capabilities: CAPABILITY_NAMED_IAM
+                TemplatePath: !Sub DevOps::infra/ecs.yml
+                RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+                ParameterOverrides: !Sub |
+                  {
+                    "ClusterName": "${ClusterName}",
+                    "ECSInstanceTypeWeb": "${ECSInstanceTypeWeb}",
+                    "KeyName": "${KeyName}",
+                    "AsgServiceMinWeb": "${AsgServiceMinWeb}",
+                    "AsgServiceMaxWeb": "${AsgServiceMaxWeb}",
+                    "AsgServiceDesiredWeb": "${AsgServiceDesiredWeb}",
+                    "S3Bucket": "${S3Bucket}",
+                    "EcsImage": "${EcsImage}",
+                    "HostedZoneName": "${HostedZoneName}",
+                    "TypeProject": "${TypeProject}"
+                  }
+              RunOrder: 5
+              InputArtifacts:
+                - Name: DevOps
+            - Name: ExecuteECSChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CloudFormation
+              Configuration:
+                ChangeSetName: Deploy
+                ActionMode: CHANGE_SET_EXECUTE
+                StackName: !Sub ${ClusterStackName}-ecs
+                RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+              RunOrder: 6
+Outputs:
+  PipelineUrl:
+    Value: !Sub https://console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${Pipeline}

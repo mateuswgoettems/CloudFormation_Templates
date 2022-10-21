@@ -1,0 +1,352 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Sets up pipeline for app sb
+Parameters:
+  GitHubRepo:
+    Type: String
+
+  GitHubBranch:
+    Type: String
+
+  GitHubOwner:
+    Type: String
+    
+  InfraGitHubOwner:
+    Type: String
+
+  InfraRepo:
+    Type: String
+
+  InfraBranch:
+    Type: String
+
+  GitHubToken:
+    Type: String
+
+  StackName:
+    Type: String
+
+  HostedZoneName:
+    Type: String
+
+  ENV:
+    Type: String
+  
+  ProjectName:
+    Type: String
+  
+  ######## services parameters ########
+  MemoryReservation:
+    Default: "1024"
+    Type: String
+
+  CPU:
+    Default: 1
+    Type: Number
+
+  ClusterName:
+    Type: String
+
+  CertificateArn:
+    Type: String
+
+  LoadBalancerCname:
+    Type: String
+  
+  ContainerPort:
+    Type: String
+    Default: 3000
+  
+  ApiHealthCheckPath:
+    Type: String
+    Default: "/"
+  
+  EnvironmentFolder:
+    Type: String
+    Default: development
+  
+  SiteTgPriority:
+    Type: String
+    Default: 1
+    
+
+
+Resources:
+  ArtifactBucket: 
+    Type: 'AWS::S3::Bucket'
+    Properties: {}
+
+  Repository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    Properties: 
+      RepositoryName: !Sub ${ProjectName}
+
+  CloudFormationExecutionRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    Properties:
+      RoleName: !Sub cfn-${ClusterName}-${ProjectName}
+      Path: /
+      AssumeRolePolicyDocument: |
+        {
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Service": [ "cloudformation.amazonaws.com" ]},
+                "Action": [ "sts:AssumeRole" ]
+            }]
+        }
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - ecs:*
+                  - ecr:*
+                  - iam:*
+                  - ec2:*
+                  - logs:*
+                  - route53:*
+                  - codebuild:*
+                  - codepipeline:*
+                  - elasticloadbalancing:*
+                  - application-autoscaling:*
+                  - secretsmanager:*
+                  - ssm:*
+                  - kms:*
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub cb-${ClusterName}-${ProjectName}
+      Path: /
+      AssumeRolePolicyDocument: |
+        {
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Service": [ "codebuild.amazonaws.com" ]},
+                "Action": [ "sts:AssumeRole" ]
+            }]
+        }
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - cloudformation:*
+                  - ecs:*
+                  - ecr:*
+                  - ec2:*
+                  - ssm:*
+                  - secretsmanager:*
+                  - kms:*
+              - Resource: !Sub arn:aws:s3:::${ArtifactBucket}/*
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetObjectVersion
+              - Resource: !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${Repository}
+                Effect: Allow
+                Action:
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub cp-${ClusterName}-${ProjectName}
+      Path: /
+      AssumeRolePolicyDocument: |
+        {
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Service": [ "codepipeline.amazonaws.com" ]},
+                "Action": [ "sts:AssumeRole" ]
+            }]
+        }
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource:
+                  - !Sub arn:aws:s3:::*
+                Effect: Allow
+                Action:
+                  - s3:*
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - codebuild:*
+                  - cloudformation:*
+                  - iam:PassRole
+                  - codestar-connections:*
+                  - ecr:*
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub cb-${ClusterName}-${ProjectName}
+      ServiceRole: !Ref CodeBuildServiceRole
+      Cache:
+        Type: LOCAL
+        Modes:
+          - LOCAL_DOCKER_LAYER_CACHE
+      Artifacts:
+        Type: CODEPIPELINE
+        Name: !Ref ProjectName
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Sub "buildspec/build-backend.yml"
+      VpcConfig:
+        VpcId:
+          'Fn::ImportValue': !Sub ${ClusterName}VPC
+        Subnets: 
+          - 'Fn::ImportValue': !Sub ${ClusterName}PrivateSubnet1
+          - 'Fn::ImportValue': !Sub ${ClusterName}PrivateSubnet2
+        SecurityGroupIds:
+          - 'Fn::ImportValue': !Sub ${ClusterName}InternalAccessSecurityGroup
+      Environment:
+        ComputeType: "BUILD_GENERAL1_LARGE"
+        Image: "aws/codebuild/docker:17.09.0"
+        Type: "LINUX_CONTAINER"
+        EnvironmentVariables:
+          - Name: BRANCH
+            Value: !Ref GitHubBranch
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: REPOSITORY_URI
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${Repository}
+          - Name: ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: StackName
+            Value: !Ref StackName
+          - Name: PROPERTIES_NAME
+            Value: !Ref ArtifactBucket
+          - Name: CLUSTER_NAME
+            Value: !Ref ClusterName
+          - Name: SITE_NAME
+            Value: !Ref LoadBalancerCname
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub cp-${ClusterName}-${ProjectName}
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: App
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Version: 1
+                Provider: GitHub
+              Configuration:
+                Owner: !Ref GitHubOwner
+                Repo: !Ref GitHubRepo
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Ref GitHubToken
+              OutputArtifacts:
+                - Name: App
+              RunOrder: 1
+            - Name: Infra
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Version: 1
+                Provider: GitHub
+              Configuration:
+                Owner: !Ref InfraGitHubOwner
+                Repo: !Ref InfraRepo
+                Branch: !Ref InfraBranch
+                OAuthToken: !Ref GitHubToken
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: Infra
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+                PrimarySource: Infra
+              InputArtifacts:
+                - Name: App
+                - Name: Infra
+              OutputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+        - Name: DeployApp
+          Actions:  
+            - Name: CreateChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CloudFormation
+              Configuration:
+                ChangeSetName: Deploy
+                ActionMode: CHANGE_SET_REPLACE
+                StackName: !Sub ${ClusterName}-backend-service-stack
+                Capabilities: CAPABILITY_NAMED_IAM
+                TemplatePath: !Sub Infra::services/backend-service.yml
+                RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+                ParameterOverrides: !Sub |
+                  {
+                    "HostedZoneName": "${HostedZoneName}",
+                    "CertificateArn": "${CertificateArn}",
+                    "ClusterName": "${ClusterName}",
+                    "ContainerVirtualCPUs": "${CPU}",
+                    "ContainerMemoryMin": "${MemoryReservation}",
+                    "LoadBalancerCname": "${LoadBalancerCname}",
+                    "EcsTasksNumber": "1",
+                    "DockerImageVersion": { "Fn::GetParam" : [ "BuildOutput", "build.json", "tag" ] },
+                    "ProjectName": "${ProjectName}",
+                    "SiteTgPriority": "${SiteTgPriority}",
+                    "StageEnv": "${ENV}",
+                    "ContainerPort": "${ContainerPort}",
+                    "AlbHealthCheckPath": "${ApiHealthCheckPath}"
+                  }
+              RunOrder: 1
+              InputArtifacts:
+                - Name: Infra
+                - Name: BuildOutput
+            - Name: ExecuteChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CloudFormation
+              Configuration:
+                ChangeSetName: Deploy
+                ActionMode: CHANGE_SET_EXECUTE
+                StackName: !Sub ${ClusterName}-backend-service-stack
+                RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+              RunOrder: 2
+
+Outputs:
+  PipelineUrl:
+    Value: !Sub https://console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${Pipeline}

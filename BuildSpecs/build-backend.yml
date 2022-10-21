@@ -1,0 +1,33 @@
+version: 0.2
+env:
+  parameter-store:
+    DB_USER: /ECS-CLUSTER/mg-cluster/RDS_ROOT_USERNAME
+    DB_PASSWORD: /ECS-CLUSTER/mg-cluster/RDS_ROOT_PASSWORD
+    DB_HOST: /ECS-CLUSTER/mg-cluster/RDS_ADDRESS
+    DB_PORT: /ECS-CLUSTER/mg-cluster/RDS_PORT
+phases:
+  install:
+    commands:
+      - $(aws ecr get-login --no-include-email --region $AWS_DEFAULT_REGION)
+      # - $(aws ecr get-login --no-include-email --region $AWS_DEFAULT_REGION)
+      - START_TIME=$(echo $CODEBUILD_START_TIME | cut -c 1-7)
+      - IMAGE_TAG=${START_TIME:=latest}
+      - TAG="latest"
+  pre_build:
+    commands:
+      - cd $CODEBUILD_SRC_DIR_App/
+      - docker info
+  build:
+    commands:
+      - docker build --build-arg DB_USER=$DB_USER --build-arg DB_PASSWORD=$DB_PASSWORD --build-arg DB_HOST=$DB_HOST --build-arg DB_PORT=$DB_PORT -t $REPOSITORY_URI:$TAG . 
+      - docker tag $REPOSITORY_URI:$TAG $REPOSITORY_URI:$IMAGE_TAG 
+  post_build:
+    commands:
+      - docker push "${REPOSITORY_URI}:${TAG}"
+      - docker push "${REPOSITORY_URI}:${IMAGE_TAG}"
+      - printf '{"tag":"%s:%s"}' "$REPOSITORY_URI" "$IMAGE_TAG" > /tmp/build.json
+      - cat /tmp/build.json
+artifacts:
+  files: 
+    - /tmp/build.json
+  discard-paths: yes

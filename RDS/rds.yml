@@ -1,0 +1,157 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Sets up ecs cluster
+Parameters:
+  ClusterName:
+    Type: String
+
+  DBInstanceType:
+    Type: String
+
+  DBKmsKeyIdArn:
+    Type: String
+    Default: ""
+
+  DBSnapshotName:
+    Type: String
+
+  DBHasMultiAZ:
+    AllowedValues: [true, false]
+    Type: String
+    Default: true
+
+  DBHasAutomaticBackup:
+    AllowedValues: [true, false]
+    Type: String
+
+  HostedZoneName:
+    Type: String
+
+  CidrIp:
+    Type: String
+    Default: 172.20.0.0
+
+  PrxServerDBName:
+    Type: String
+    Default: developdb
+
+Conditions:
+  dbIsEncrypted: !Not [!Equals [!Ref DBKmsKeyIdArn, "WITHOUT"]]
+  dbHasSnapshot: !Not [!Equals [!Ref DBSnapshotName, "WITHOUT"]]
+  dbHasAutomaticBackup: !Equals [!Ref DBHasAutomaticBackup, "true"]
+  dbHasMultiAZ: !Equals [!Ref DBHasMultiAZ, "true"]
+
+Resources:
+#========== Security Groups
+  RDSSecurityGroup:
+   Type: AWS::EC2::SecurityGroup
+   Properties:
+     VpcId:
+       'Fn::ImportValue': !Sub ${ClusterName}VPC
+     GroupName: !Sub ${ClusterName}AllowRDS
+     GroupDescription: Enables RDS access
+     SecurityGroupIngress:
+       - IpProtocol: tcp
+         FromPort: 5432
+         ToPort: 5432
+         CidrIp: !Sub ${CidrIp}/16
+       - IpProtocol: -1
+         FromPort: 0
+         ToPort: 65535
+         CidrIp: 172.20.0.0/20
+
+#========== RDS
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      SubnetIds:
+        - 'Fn::ImportValue': !Sub ${ClusterName}PublicSubnet1
+        - 'Fn::ImportValue': !Sub ${ClusterName}PublicSubnet2
+      DBSubnetGroupDescription: Database Subnet Group
+
+  DBParameterGroup:
+     Type: 'AWS::RDS::DBParameterGroup'
+     Properties:
+       Description: !Ref 'AWS::StackName'
+       Family: aurora-postgresql12
+       Parameters:
+         apg_plan_mgmt.max_databases: 10
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: 12.4
+      DBClusterIdentifier: !Ref DatabaseCluster
+      DBInstanceClass: !Ref DBInstanceType
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      DBInstanceIdentifier: !Ref ClusterName
+      PubliclyAccessible: false
+      DBParameterGroupName: !Ref DBParameterGroup
+
+  DBClusterParameterGroup:
+     Type: 'AWS::RDS::DBClusterParameterGroup'
+     Properties:
+       Description: !Ref 'AWS::StackName'
+       Family: aurora-postgresql12
+       Parameters:
+         apg_plan_mgmt.max_databases: 10
+
+  DatabaseCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: 12.4
+      SnapshotIdentifier: !If [dbHasSnapshot, !Ref DBSnapshotName, !Ref 'AWS::NoValue']
+      MasterUsername: !If [dbHasSnapshot, !Ref 'AWS::NoValue', !Sub '{{resolve:ssm:/ECS-CLUSTER/${ClusterName}/RDS_ROOT_USERNAME:1}}']
+      MasterUserPassword: !If [dbHasSnapshot, !Ref 'AWS::NoValue', !Sub '{{resolve:ssm-secure:/ECS-CLUSTER/${ClusterName}/RDS_ROOT_PASSWORD:1}}']
+      VpcSecurityGroupIds:
+       - !Ref RDSSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      BackupRetentionPeriod: !If [dbHasAutomaticBackup, 35, 0]
+      DBClusterParameterGroupName: !Ref DBClusterParameterGroup
+      Port: '5432'
+
+  SsmRdsAddress:
+   Type: AWS::SSM::Parameter
+   Properties:
+     Name: !Sub /ECS-CLUSTER/${ClusterName}/RDS_ADDRESS
+     Value: !Sub ${DBInstance.Endpoint.Address}
+     Type: String
+
+  SsmRdsUrl:
+   Type: AWS::SSM::Parameter
+   Properties:
+     Name: !Sub /ECS-CLUSTER/${ClusterName}/PRX_SERVER/RDS_URL
+     Value: !Sub ${DBInstance.Endpoint.Address}/${PrxServerDBName}
+     Type: String
+
+  SsmRdsPort:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /ECS-CLUSTER/${ClusterName}/RDS_PORT
+      Value: !Sub ${DBInstance.Endpoint.Port}
+      Type: String
+
+  # ========== Security Groups
+  RDSDNS:
+   Type: AWS::Route53::RecordSetGroup
+   Properties:
+     HostedZoneName: !Sub ${HostedZoneName}
+     RecordSets:
+       - Name: !Sub ${ClusterName}-db.${HostedZoneName}
+         Type: CNAME
+         TTL: 60
+         ResourceRecords:
+           - !Sub ${DBInstance.Endpoint.Address}
+
+Outputs:
+
+ RDSSecurityGroup:
+   Value: !Ref RDSSecurityGroup
+   Export:
+     Name: !Sub ${ClusterName}RDSSecurityGroup
+
+ DBInstance:
+   Value: !Ref DBInstance
+   Export:
+     Name: !Sub ${ClusterName}DBInstance

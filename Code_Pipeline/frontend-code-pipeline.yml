@@ -1,0 +1,338 @@
+Parameters: 
+  GithubOwner:
+    Type: String
+    Description: "Github repo owner"
+
+  GithubRepo:
+    Type: String
+    Description: "Github repo name"
+
+  GitHubBranch:
+    Type: String
+    Description: "GitHub branch"
+
+  GithubOAuthToken:
+    Type: String
+    Description: "Github personal access token"
+
+  InfraGithubOwner:
+    Type: String
+    Description: "Infra Github repo owner"
+
+  InfraGithubRepo:
+    Type: String
+    Description: "GitHub Infra Repository"
+
+  InfraGitHubBranch:
+    Type: String
+    Description: "GitHub Infra Repository branch"
+
+  ProjectName:
+    Type: String
+    Description: "Project Name"
+
+  HostedZoneName:
+    Type: String
+    Description: "Route 53 hosted zone name"
+
+  CNAME:
+    Type: String
+    Description: "Site CNAME Url"
+
+  CertificateArn:
+    Type: String
+    Description: "ACM Certificate ARN"
+
+  Environment:
+    Type: String
+    Description: "Application Environment Type"
+    Default: "development"
+
+  ClusterName:
+    Type: String
+    Description: "Cluster Name of Environment"
+    
+  EnvSecretsManager:
+    Type: String
+    Description: "Environment to Secrets Manager"
+    
+  BuildFolder:
+    Type: String
+    Description: "name of the folder created during the build"
+    Default: dist
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Label:
+        default: GitHub App Params
+      Parameters:
+        - GitHubOwner
+        - GitHubToken
+        - GitHubRepo
+        - GitHubBranch
+
+    - Label:
+        default: GitHub Infra Params
+      Parameters:
+        - InfraGitHubRepo
+        - InfraGitHubBranch
+
+    - Label:
+        default: Cloudfront Params
+      Parameters:
+        - ProjectName
+        - HostedZoneName
+        - CNAME
+        - CertificateArn
+
+Resources:
+  CloudFormationExecutionRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    Properties:
+      RoleName: !Sub cfn-${AWS::StackName}
+      Path: /
+      AssumeRolePolicyDocument: |
+        {
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Service": [ "cloudformation.amazonaws.com" ]},
+                "Action": [ "sts:AssumeRole" ]
+            }]
+        }
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - iam:*
+                  - route53:*
+                  - ssm:*
+                  - cloudfront:*
+                  - cloudformation:*
+              - Resource: !Sub arn:aws:s3:::*
+                Effect: Allow
+                Action:
+                  - s3:*
+
+  CodeBuild:
+    Type: 'AWS::CodeBuild::Project'
+    Properties:
+      Name: !Sub ${AWS::StackName}-CodeBuild
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+        Name: !Ref ProjectName
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Sub "buildspec/build-frontend.yml"
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Type: LINUX_CONTAINER
+        Image: "aws/codebuild/standard:5.0"
+        EnvironmentVariables:
+          - Name: ProjectName
+            Value: !Ref ProjectName
+          - Name: ClusterName
+            Value: !Ref ClusterName
+          - Name: ENV
+            Value: !Ref Environment
+          - Name: Environment
+            Value: !Ref EnvSecretsManager
+          - Name: BuildFolder
+            Value: !Ref BuildFolder
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - 
+            Effect: Allow
+            Principal:
+              Service:
+                - "codebuild.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: /service-role/
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement: 
+              - 
+                Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:GetObjectVersion"
+                  - "s3:GetBucketVersioning"
+                  - "s3:PutObject"
+                  - "s3:ListBucket"
+                Resource: 
+                  - !GetAtt PipelineBucket.Arn
+                  - !Join ['', [!GetAtt PipelineBucket.Arn, "/*"]]
+              - 
+                Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:GetObjectVersion"
+                  - "s3:GetBucketVersioning"
+                  - "s3:PutObject"
+                  - "s3:PutObjectAcl"
+                  - "s3:ListBucket"
+                Resource: 
+                  - !Sub arn:aws:s3:::${CNAME}/* 
+                  - !Join ['', [!Sub "arn:aws:s3:::${CNAME}", "/*"]]
+              -
+                Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "cloudfront:CreateInvalidation"
+                  - "ssm:DescribeParameters"
+                  - "ssm:GetParameters"
+                  - "secretsmanager:GetSecretValue"
+                Resource:
+                  - "*"
+
+  CodePipeline:
+    Type: 'AWS::CodePipeline::Pipeline'
+    Properties:
+      Name: !Sub cp-${ProjectName}
+      RoleArn: !GetAtt CodePipeLineRole.Arn
+      ArtifactStore:
+        Location: !Ref PipelineBucket
+        Type: S3
+      Stages:
+        - Name: Source
+          Actions: 
+            - Name: InfraSourceAction
+              ActionTypeId: 
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: 1
+              OutputArtifacts: 
+                - Name: Infra
+              Configuration:
+                Owner: !Ref InfraGithubOwner
+                Repo: !Ref InfraGithubRepo
+                Branch: !Ref InfraGitHubBranch
+                OAuthToken: !Ref GithubOAuthToken
+                PollForSourceChanges: false
+            - Name: SourceAction
+              ActionTypeId: 
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: 1
+              OutputArtifacts: 
+                - Name: App
+              Configuration:
+                Owner: !Ref GithubOwner
+                Repo: !Ref GithubRepo
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Ref GithubOAuthToken
+                PollForSourceChanges: false     
+        - Name: DeployCloudformation
+          Actions:
+            - Name: CreateCloudfrontChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CloudFormation
+              Configuration:
+                ChangeSetName: Deploy
+                ActionMode: CHANGE_SET_REPLACE
+                StackName: !Sub ${ClusterName}-${ProjectName}-cloudfront-stack
+                Capabilities: CAPABILITY_NAMED_IAM
+                TemplatePath: Infra::infra/cloudfront-web-app.yml
+                RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+                ParameterOverrides: !Sub |
+                  {
+                    "BucketName": "${CNAME}",
+                    "HostedZoneName": "${HostedZoneName}",
+                    "CNAME": "${CNAME}",
+                    "CertificateArn": "${CertificateArn}",
+                    "ProjectName": "${ProjectName}",
+                    "ClusterName": "${ClusterName}"
+                  }
+              RunOrder: 1
+              InputArtifacts:
+                - Name: Infra
+            - Name: ExecuteCloudfrontChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CloudFormation
+              Configuration:
+                ChangeSetName: Deploy
+                ActionMode: CHANGE_SET_EXECUTE
+                StackName: !Sub ${ClusterName}-${ProjectName}-cloudfront-stack
+                RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+              RunOrder: 2      
+        - Name: BuildAndDeploy
+          Actions: 
+            - Name: BuildAction
+              ActionTypeId: 
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              InputArtifacts: 
+                - Name: Infra
+                - Name: App
+              OutputArtifacts: 
+                - Name: MyAppBuild
+              Configuration:
+                ProjectName: !Ref CodeBuild
+                PrimarySource: Infra
+
+  CodePipeLineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - 
+            Effect: Allow
+            Principal:
+              Service:
+                - "codepipeline.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement: 
+              - 
+                Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:GetObjectVersion"
+                  - "s3:GetBucketVersioning"
+                  - "s3:PutObject"
+                Resource: 
+                  - !GetAtt PipelineBucket.Arn
+                  - !Join ['', [!GetAtt PipelineBucket.Arn, "/*"]]
+              - 
+                Effect: Allow  
+                Action:
+                  - "codebuild:BatchGetBuilds"
+                  - "codebuild:StartBuild"
+                  - "cloudformation:*"
+                  - "iam:*"
+                Resource: "*"
+  # Temp bucket for storing build artifacts
+  PipelineBucket: 
+    Type: 'AWS::S3::Bucket'
+    Properties: {}

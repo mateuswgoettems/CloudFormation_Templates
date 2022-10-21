@@ -1,0 +1,127 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Cloufront
+Parameters:
+  BucketName:
+    Type: String
+  HostedZoneName:
+    Type: String
+  CNAME:
+    Type: String
+  CertificateArn:
+    Type: String
+  ProjectName:
+    Type: String
+  ClusterName:
+    Type: String
+
+Resources:
+  EncryptedS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${BucketName}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      AccessControl: PublicRead
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: 'false'
+        BlockPublicPolicy: 'false'
+        IgnorePublicAcls: 'false'
+        RestrictPublicBuckets: 'false'
+      WebsiteConfiguration:
+        ErrorDocument: 'index.html'
+        IndexDocument: 'index.html'
+      VersioningConfiguration:
+        Status: 'Enabled'
+        
+#==========================================================================================
+  cloudfrontoriginaccessidentity:
+    DependsOn: EncryptedS3Bucket
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub "${ProjectName}-access-identity-${BucketName}.s3.amazonaws.com"
+#==========================================================================================
+  ReadPolicy:
+    DependsOn: cloudfrontoriginaccessidentity
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Sub "${BucketName}"
+      PolicyDocument:
+        Statement:
+          - Action: 's3:GetObject'
+            Effect: Allow
+            Resource: !Sub "arn:aws:s3:::${BucketName}/*"
+            Principal:
+              CanonicalUser: !Sub ${cloudfrontoriginaccessidentity.S3CanonicalUserId}
+
+  CfnDistribution:
+    DependsOn: cloudfrontoriginaccessidentity
+    Type: 'AWS::CloudFront::Distribution'
+    Properties:
+      DistributionConfig:
+        HttpVersion: http2
+        Origins:
+          -
+            DomainName: !Sub "${BucketName}.s3.amazonaws.com"
+            Id: !Sub "${ProjectName}-distribution-id"
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub "origin-access-identity/cloudfront/${cloudfrontoriginaccessidentity}"
+        Enabled: 'true'
+        DefaultRootObject: index.html
+        DefaultCacheBehavior:
+          MaxTTL: 31536000
+          MinTTL: 0
+          Compress: false
+          TargetOriginId: !Sub "${ProjectName}-distribution-id"
+          SmoothStreaming: 'false'
+          ForwardedValues:
+            QueryString: 'false'
+            Cookies:
+              Forward: none
+          ViewerProtocolPolicy: redirect-to-https
+        CustomErrorResponses:
+          - ErrorCode: '403'
+            ResponsePagePath: "/index.html"
+            ResponseCode: '200'
+            ErrorCachingMinTTL: '300'
+        Aliases:
+          - !Ref CNAME
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.1_2016
+
+  DNS:
+    DependsOn: CfnDistribution
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneName: !Sub ${HostedZoneName}
+      RecordSets:
+        - Name: !Ref CNAME
+          Type: CNAME
+          TTL: 60
+          ResourceRecords:
+            - !Sub ${CfnDistribution.DomainName}          
+
+  CfnDNS:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: !Sub '/ECS-CLUSTER/${ClusterName}/${ProjectName}/BASE_DOMAIN'
+      Value: !Ref CNAME
+      Type: String
+
+  CfnDistributionId:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: !Sub '/ECS-CLUSTER/${ClusterName}/${ProjectName}/DISTRIBUTION_ID'
+      Value: !Ref CfnDistribution
+      Type: String
+      
+  S3Name:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: !Sub '/ECS-CLUSTER/${ClusterName}/${ProjectName}/AWS_S3'
+      Value: !Ref EncryptedS3Bucket
+      Type: String

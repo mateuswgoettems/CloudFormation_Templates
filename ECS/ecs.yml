@@ -1,0 +1,288 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Sets up ecs cluster
+Parameters:
+  ClusterName:
+    Type: String
+
+  ECSInstanceTypeWeb:
+    Type: String
+    Default: "t2.micro"
+
+  KeyName:
+    Type: String
+  
+  AsgServiceMinWeb:
+    Type: String
+    Default: "2"
+
+  AsgServiceDesiredWeb:
+    Type: String
+    Default: "3"
+
+  AsgServiceMaxWeb:
+    Type: String
+
+  S3Bucket:
+    Type: String
+
+  TypeProject:
+    Type: String
+
+  EcsImage:
+    Type: String
+
+  HostedZoneName:
+    Type: String
+
+Resources:
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs-cluster/${ClusterName}
+
+#========== Roles
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::Region}-${ClusterName}_EC2Role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - 'ec2.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AdministratorAccess'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref EC2Role
+      InstanceProfileName: !Sub ${AWS::Region}-${ClusterName}_EC2InstanceProfile
+
+  ECSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::Region}-${ClusterName}_ECSRole
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - 'ecs.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceRole'
+
+#========== Security Groups
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId:
+        'Fn::ImportValue': !Sub ${ClusterName}VPC
+      GroupName: !Sub ${ClusterName}AllowSSH
+      GroupDescription: Enables access to all IPs to port 22
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: -1
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 172.20.0.0/20
+
+#========== ECS
+  PrivateNameSpace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Description: !Sub Private Name for Cluster ${ClusterName}
+      Vpc:
+        'Fn::ImportValue': !Sub ${ClusterName}VPC
+      Name: !Sub ${ClusterName}.internal
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${ClusterName}
+
+#========== EC2
+  BastionEIP:
+      Type: AWS::EC2::EIP
+      Properties:
+        Domain: vpc
+
+  BastionInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${ClusterName} bastion
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          GroupSet:
+            - !Ref BastionSecurityGroup
+            - 'Fn::ImportValue': !Sub ${ClusterName}InternalAccessSecurityGroup
+          SubnetId:
+            'Fn::ImportValue': !Sub ${ClusterName}PublicSubnet1
+      ImageId: !Ref EcsImage
+      InstanceType: 't2.nano'
+      KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref EC2InstanceProfile
+
+  BastionAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt BastionEIP.AllocationId
+      InstanceId: !Ref BastionInstance
+
+  BastionDNS:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneName: !Sub ${HostedZoneName}
+      RecordSets:
+        - Name: !Sub ${ClusterName}-bastion.${HostedZoneName}
+          Type: A
+          TTL: 5
+          ResourceRecords:
+            - !Ref BastionEIP
+            
+  SsmBastionIp:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ClusterName}/RDS/BASTION
+      Value: !Sub ${BastionInstance.PublicIp}
+      Type: String
+
+  LaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      KeyName: !Ref KeyName
+      ImageId: !Ref EcsImage
+      SecurityGroups:
+        - 'Fn::ImportValue': !Sub ${ClusterName}InternalAccessSecurityGroup
+      InstanceType: !Ref ECSInstanceTypeWeb
+      AssociatePublicIpAddress: false
+      BlockDeviceMappings:
+        - DeviceName: "/dev/xvda"
+          Ebs:
+            VolumeSize: '100'
+        - DeviceName: "/dev/xvdcz"
+          Ebs:
+            VolumeSize: '100'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          #====== Resize EBS
+            resize2fs /dev/xvda
+            resize2fs /dev/xvdcz
+
+          #====== Install SSM
+            yum install -y https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm
+            start amazon-ssm-agent
+            chkconfig amazon-ssm-agent on
+
+          #====== Install AWSLOGS
+            yum install -y awslogs
+            mv /etc/awslogs/awslogs.conf /etc/awslogs/awslogs.conf.bkp
+            aws s3 cp s3://${S3Bucket}/cloudformation/${TypeProject}/awslogs.conf /etc/awslogs/awslogs.conf
+            sed -i "s/clustername/${ECSCluster}/g" /etc/awslogs/awslogs.conf
+            sed -i "s/instanceID/`curl -s http://169.254.169.254/latest/meta-data/instance-id`/g" /etc/awslogs/awslogs.conf
+            service awslogs start
+            chkconfig awslogs on
+
+          echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+          echo ECS_INSTANCE_ATTRIBUTES={\"cluster_type\":\"web\"} >> /etc/ecs/ecs.config
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${ClusterName} cluster
+          PropagateAtLaunch: true
+      LaunchConfigurationName: !Ref LaunchConfiguration
+      MinSize: !Ref AsgServiceMinWeb
+      DesiredCapacity: !Ref AsgServiceDesiredWeb
+      MaxSize: !Ref AsgServiceMaxWeb
+      TargetGroupARNs:
+        - 'Fn::ImportValue': !Sub ${ClusterName}BackendAlbDefaultTargetGroup
+      VPCZoneIdentifier:
+        - 'Fn::ImportValue': !Sub ${ClusterName}PrivateSubnet1
+        - 'Fn::ImportValue': !Sub ${ClusterName}PrivateSubnet2
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MaxBatchSize: '1'
+        MinInstancesInService: !Ref AsgServiceDesiredWeb
+        PauseTime: 'PT5M'
+
+#========== Actions for ASG
+  ScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      Cooldown: 1
+      ScalingAdjustment: -1
+
+  ScaleDownPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      Cooldown: 1
+      ScalingAdjustment: 1
+
+Outputs:
+  PrivateNameSpace:
+    Value: !Ref PrivateNameSpace
+    Export:
+      Name: !Sub ${ClusterName}PrivateNameSpace
+
+  PrivateNameSpaceName:
+    Value: !Sub ${ClusterName}.internal
+    Export:
+      Name: !Sub ${ClusterName}PrivateNameSpaceName
+
+  ScaleUpPolicy:
+    Value: !Ref ScaleUpPolicy
+    Export:
+      Name: !Sub ${ClusterName}ScaleUpPolicy
+
+  ScaleDownPolicy:
+    Value: !Ref ScaleDownPolicy
+    Export:
+      Name: !Sub ${ClusterName}ScaleDownPolicy
+
+  BastionSecurityGroup:
+    Value: !Ref BastionSecurityGroup
+    Export:
+      Name: !Sub ${ClusterName}BastionSecurityGroup
+
+  ECSRoleArn:
+    Value: !Sub ${ECSRole.Arn}
+    Export:
+      Name: !Sub ${ClusterName}ECSRoleArn
+
+  ECSCluster:
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub ${ClusterName}ECSCluster
+
+  ECSClusterArn:
+    Value: !Sub ${ECSCluster.Arn}
+    Export:
+      Name: !Sub ${ClusterName}ECSClusterArn
+
+  AutoScalingGroup:
+    Value: !Ref AutoScalingGroup
+    Export:
+      Name: !Sub ${ClusterName}AutoScalingGroup

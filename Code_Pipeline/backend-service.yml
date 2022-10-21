@@ -1,0 +1,312 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Sets Up Service Web
+Parameters:
+  ClusterName:
+    Type: String
+    Default: Application
+
+  EcsTasksNumber:
+    Type: String
+    Default: 1
+
+  ContainerPort:
+    Type: String
+    Default: 3000
+
+  ContainerVirtualCPUs:
+    Type: String
+    Default: 1
+
+  ContainerMemoryMin:
+    Type: String
+    Default: 4096
+
+  ContainerMemoryMax:
+    Type: String
+    Default: LIMITLESS
+
+  DockerImageVersion:
+    Type: String
+
+  HostedZoneName:
+    Type: String
+   
+  CertificateArn:
+    Type: String
+
+  AlbHealthCheckInterval:
+    Type: String
+    Default: 30
+
+  AlbHealthCheckPath:
+    Type: String
+    Default: /v1/health
+
+  AlbHealthCheckTimeout:
+    Type: String
+    Default: 10
+
+  AlbHealthCheckHealthyThreshold:
+    Type: String
+    Default: 10
+
+  AlbHealthCheckUnhealthyThreshold:
+    Type: String
+    Default: 10
+
+  SiteTgPriority:
+    Type: String
+    Default: 10
+
+  LoadBalancerCname:
+    Type: String
+
+  AlbHealthCheckStartPeriod:
+    Type: String
+    Default: 30
+
+  ContainerNetworkMode:
+    Type: String
+    Default: bridge
+
+  ContainerHealthCheckInterval:
+    Type: String
+    Default: 30
+
+  ContainerHealthCheckTimeout:
+    Type: String
+    Default: 10
+
+  ContainerHealthCheckRetries:
+    Type: String
+    Default: 5
+
+  ContainerHealthCheckStartPeriod:
+    Type: String
+    Default: 200
+
+  EcsTypePlacementStrategy:
+    Type: String
+    Default: binpack
+
+  EcsFieldPlacementStrategy:
+    Type: String
+    Default: cpu
+
+  HasHTTPS:
+    Type: String
+    Default: true
+
+  ProjectName:
+    Type: String
+  
+  StageEnv:
+    Type: String
+    Default: "DEV"
+
+  
+Conditions:
+  hasSSL: !Equals [!Ref HasHTTPS, "true"]
+  hasOnlyOneTask: !Equals [!Ref EcsTasksNumber, "1"]
+  containerHasMemoryLimit: !Not [!Equals [!Ref ContainerMemoryMax, "LIMITLESS"]]
+  hasServiceDiscovery: !Equals [!Ref ContainerNetworkMode, "awsvpc"]
+
+Resources:
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub mg-prova/${StageEnv}/API
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub tg-${ProjectName}
+      VpcId:
+        "Fn::ImportValue": !Sub ${ClusterName}VPC
+      Protocol: HTTP
+      TargetType: !If [hasServiceDiscovery, "ip", "instance"]
+      Port: !Ref ContainerPort
+      Matcher:
+        HttpCode: "200-499"
+      HealthCheckIntervalSeconds: !Ref AlbHealthCheckInterval
+      HealthCheckPath: !Ref AlbHealthCheckPath
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: !Ref AlbHealthCheckTimeout
+      HealthyThresholdCount: !Ref AlbHealthCheckHealthyThreshold
+      UnhealthyThresholdCount: !Ref AlbHealthCheckUnhealthyThreshold
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 30
+        - Key: stickiness.enabled
+          Value: true
+
+  ListenerCertificate:
+    Type: AWS::ElasticLoadBalancingV2::ListenerCertificate
+    Condition: hasSSL
+    Properties:
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      ListenerArn:
+        "Fn::ImportValue": !Sub ${ClusterName}BackendAlbListenerForHttps
+
+  SiteNameListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !If
+        - hasSSL
+        - "Fn::ImportValue": !Sub ${ClusterName}BackendAlbListenerForHttps
+        - "Fn::ImportValue": !Sub ${ClusterName}BackendAlbListenerForHttp
+      Priority: !Ref SiteTgPriority
+      Conditions:
+        - Field: host-header
+          Values:
+            - !Sub ${LoadBalancerCname}
+      Actions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+
+  DNS:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneName: !Sub ${HostedZoneName}
+      RecordSets:
+        - Name: !Sub ${LoadBalancerCname}
+          Type: CNAME
+          TTL: 60
+          ResourceRecords:
+            - "Fn::ImportValue": !Sub "${ClusterName}BackendAlbDns"
+
+  EcsExecutionRoleArn:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ExecutionRole-${ClusterName}-${ProjectName}
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 
+              - 'ecs-tasks.amazonaws.com'
+            AWS:
+              - !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+          Action:
+            - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: ECSTaskExecutionRolePolicy
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action:
+                - 'ecs:*'
+                - 'ecr:*'
+                - 'ec2:*'
+                - 'logs:CreateLogStream'
+                - 'logs:PutLogEvents'
+                - 'ssm:GetParameters'
+                - 'secretsmanager:GetSecretValue'
+                - 'kms:Decrypt'
+              Resource: '*'
+  
+  Task:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}_taskDefinition
+      NetworkMode: !Ref ContainerNetworkMode
+      ExecutionRoleArn: !Ref EcsExecutionRoleArn
+      ContainerDefinitions:
+        - Name: !Sub ${ProjectName}_container
+          Image: !Sub ${DockerImageVersion}
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              HostPort: !If [hasServiceDiscovery, !Ref ContainerPort, 0]
+          MemoryReservation: !Ref ContainerMemoryMin
+          Memory:
+            !If [
+              containerHasMemoryLimit,
+              !Ref ContainerMemoryMax,
+              !Ref "AWS::NoValue",
+            ]
+          Cpu: !Ref ContainerVirtualCPUs
+          Hostname: !Sub Application.${ClusterName}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub mg-prova/${StageEnv}/API
+              awslogs-stream-prefix: /service
+              awslogs-region: !Ref AWS::Region
+          Privileged: true
+          Environment:
+            - Name: AWS_REGION
+              Value: 'us-west-1'
+            - Name: AWS_SECRET_ID
+              Value: !Sub '${StageEnv}/API'
+
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub ${ProjectName}-service
+      Cluster:
+        "Fn::ImportValue": !Sub ${ClusterName}ECSCluster
+      Role: !If
+        - hasServiceDiscovery
+        - !Ref AWS::NoValue
+        - 'Fn::ImportValue': !Sub ${ClusterName}ECSRoleArn
+      TaskDefinition: !Ref Task
+      DesiredCount: !Ref EcsTasksNumber
+      PlacementConstraints:
+        - Type: distinctInstance
+      DeploymentConfiguration:
+        MinimumHealthyPercent: !If [hasOnlyOneTask, 0, 50]
+        MaximumPercent: 100
+      LoadBalancers:
+        - ContainerName: !Sub ${ProjectName}_container
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+      HealthCheckGracePeriodSeconds: !Ref AlbHealthCheckStartPeriod
+      PlacementStrategies:
+        - Type: !Sub ${EcsTypePlacementStrategy}
+          Field: !Sub ${EcsFieldPlacementStrategy}
+      NetworkConfiguration: !If
+        - hasServiceDiscovery
+        - AwsvpcConfiguration:
+            SecurityGroups:
+              - "Fn::ImportValue": !Sub ${ClusterName}InternalAccessSecurityGroup
+            Subnets:
+              - "Fn::ImportValue": !Sub ${ClusterName}PrivateSubnet1
+              - "Fn::ImportValue": !Sub ${ClusterName}PrivateSubnet2
+        - !Ref AWS::NoValue
+      ServiceRegistries: !If
+        - hasServiceDiscovery
+        - - RegistryArn: !Sub arn:aws:servicediscovery:${AWS::Region}:${AWS::AccountId}:service/${ServiceDiscoveryService}
+        - !Ref AWS::NoValue
+
+  ServiceDiscoveryService:
+    Condition: hasServiceDiscovery
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Description: !Sub "${ClusterName}-ServiceDiscovery"
+      DnsConfig:
+        DnsRecords:
+          - Type: A
+            TTL: 5
+        NamespaceId:
+          "Fn::ImportValue": !Sub ${ClusterName}PrivateNameSpace
+      HealthCheckCustomConfig:
+        FailureThreshold: 2
+      Name: !Sub ${ProjectName}
+
+Outputs:      
+  TargetGroup:
+    Value: !Ref TargetGroup
+    Export:
+      Name: !Sub tg-${ProjectName}
+      
+  TargetGroupFullName:
+    Value: !Sub ${TargetGroup.TargetGroupFullName}
+    Export:
+      Name: !Sub ${ClusterName}-tg-web-TargetGroupFullName-${ProjectName}
+
+  serviceECS:
+    Value: !Ref Service
+    Export:
+      Name: !Sub ${ProjectName}-serviceECS

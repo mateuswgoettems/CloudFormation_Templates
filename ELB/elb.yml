@@ -1,0 +1,143 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Sets up ecs cluster
+Parameters:
+  ClusterName:
+    Type: String
+
+  DefaultAcmCertificateArn:
+    Type: String
+
+
+Resources:
+#========== Security Groups
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId:
+        'Fn::ImportValue': !Sub ${ClusterName}VPC
+      GroupName: !Sub ${ClusterName}AllowWebServer
+      GroupDescription: Enables access to all IPs to port 80 and 443
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+#========== Public Application Load Balancer
+  PublicAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub public-alb-${ClusterName}
+      Type: application
+      Scheme: internet-facing
+      Subnets:
+        - 'Fn::ImportValue': !Sub ${ClusterName}PublicSubnet1
+        - 'Fn::ImportValue': !Sub ${ClusterName}PublicSubnet2
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+        - 'Fn::ImportValue': !Sub ${ClusterName}InternalAccessSecurityGroup
+
+  PublicAlbDefaultTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub public-tg-${ClusterName}-default
+      VpcId:
+        'Fn::ImportValue': !Sub ${ClusterName}VPC
+      Port: 80
+      Protocol: HTTP
+      Matcher:
+        HttpCode: '301'
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+
+  PublicAlbListenerForHttp:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref PublicAlb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Host: "#{host}"
+            Path: "/#{path}"
+            Port: 443
+            Protocol: HTTPS
+            Query: "#{query}"
+            StatusCode: HTTP_301
+
+  PublicAlbListenerForHttps:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref PublicAlb
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref DefaultAcmCertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref PublicAlbDefaultTargetGroup
+
+
+Outputs:
+  LoadBalancerSecurityGroup:
+    Value: !Ref LoadBalancerSecurityGroup
+    Export:
+      Name: !Sub ${ClusterName}LoadBalancerSecurityGroup
+
+  FrontendAlbDefaultTargetGroup:
+    Value: !Ref PublicAlbDefaultTargetGroup
+    Export:
+      Name: !Sub ${ClusterName}FrontendAlbDefaultTargetGroup
+
+  FrontendAlbDns:
+    Value: !Sub ${PublicAlb.DNSName}
+    Export:
+      Name: !Sub ${ClusterName}FrontendAlbDns
+
+  FrontendAlbFullName:
+    Value: !Sub ${PublicAlb.LoadBalancerFullName}
+    Export:
+      Name: !Sub ${ClusterName}FrontendAlbFullName
+
+  FrontendAlbListenerForHttp:
+    Value: !Ref PublicAlbListenerForHttp
+    Export:
+      Name: !Sub ${ClusterName}FrontendAlbListenerForHttp
+
+  FrontendAlbListenerForHttps:
+    Value: !Ref PublicAlbListenerForHttps
+    Export:
+      Name: !Sub ${ClusterName}FrontendAlbListenerForHttps
+
+  BackendAlbDefaultTargetGroup:
+    Value: !Ref PublicAlbDefaultTargetGroup
+    Export:
+      Name: !Sub ${ClusterName}BackendAlbDefaultTargetGroup
+
+  BackendAlbDns:
+    Value: !GetAtt PublicAlb.DNSName
+    Export:
+      Name: !Sub ${ClusterName}BackendAlbDns
+
+  BackendAlbFullName:
+    Value: !GetAtt PublicAlb.LoadBalancerFullName
+    Export:
+      Name: !Sub ${ClusterName}BackendAlbFullName
+
+  BackendAlbListenerForHttp:
+    Value: !Ref PublicAlbListenerForHttp
+    Export:
+      Name: !Sub ${ClusterName}BackendAlbListenerForHttp
+
+  BackendAlbListenerForHttps:
+    Value: !Ref PublicAlbListenerForHttps
+    Export:
+      Name: !Sub ${ClusterName}BackendAlbListenerForHttps
