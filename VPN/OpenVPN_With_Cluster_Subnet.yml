@@ -8,13 +8,6 @@ Parameters:
     AllowedValues: 
       - udp
       - tcp
-  VPCId:
-    Type: AWS::EC2::VPC::Id
-    Description: VPC Id where open VPN will be installed
-
-  SubnetId:
-    Type: AWS::EC2::Subnet::Id
-    Description: Subnet Id where open VPN will be installed
 
   OpenVPNPort:
     Type: Number
@@ -58,6 +51,10 @@ Parameters:
       - rsa
       - ec
 
+  ClusterName:
+    Type: "String"
+    Description: Name of ECS cluster
+
 Resources:
 
   # Request a new Elastic IP Address
@@ -79,7 +76,8 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: SG for OpenVPN Server
-      VpcId: !Ref VPCId
+      VpcId:
+        'Fn::ImportValue': !Sub ${ClusterName}VPC
       SecurityGroupIngress:
         - IpProtocol: !Ref OpenVPNProtocol
           FromPort: !Ref OpenVPNPort
@@ -145,7 +143,8 @@ Resources:
     Type: AWS::EC2::NetworkInterface
     Properties:
       SubnetId:
-        !Ref SubnetId
+        'Fn::ImportValue': !Sub ${ClusterName}PublicSubnet1
+        'Fn::ImportValue': !Sub ${ClusterName}PublicSubnet2
       Description: Public Interface
       GroupSet:
       - !Ref OpenVPNInstanceSG
@@ -153,7 +152,7 @@ Resources:
       Tags:
         -
           Key: Name
-          Value: VPN ENI
+          Value: !Sub ${ClusterName} VPN ENI
 
   # The EC2 instance which will host OpenVPN
   EC2OpenVPNInstance:
@@ -171,7 +170,7 @@ Resources:
       Tags:
         -
           Key: Name
-          Value: OpenVPN Server
+          Value: !Sub ${ClusterName} OpenVPN Server
 
       # User data is passed into the instance, executed as a shell script, and run only once on first boot
       # Here we invoke cfn-init on our configSet myCfnConfigSet

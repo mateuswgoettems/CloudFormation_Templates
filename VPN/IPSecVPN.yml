@@ -1,0 +1,65 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: IPSecVPN Stack
+
+Parameters:
+  CustomerPublicIPAddress:
+    Type: String
+    Description: Public IP Address of the Customer Gateway
+
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC Id where PfSense will be installed
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet Id where PfSense will be installed
+
+  RouteTableId:
+    Type: String
+    Description: Route Table ID
+
+  CIDRBlockDestination:
+    Type: String
+    Description: CIDR Block of IP on Client Side
+
+
+Resources:
+  VPCCustomerGateway:
+    Type: AWS::EC2::CustomerGateway
+    Properties:
+      BgpAsn: 65000
+      IpAddress: !Ref CustomerPublicIPAddress
+      Type: ipsec.1
+  
+  VPCVpnGateway:
+    Type: AWS::EC2::VPNGateway
+    Properties:
+      Type: ipsec.1
+
+  VPCVpnGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPCId
+      VpnGatewayId: !Ref VPCVpnGateway
+
+  VPCVpnConnectionPrimary:
+    Type: AWS::EC2::VPNConnection
+    Properties:
+      Type: ipsec.1
+      CustomerGatewayId: !Ref VPCCustomerGateway
+      StaticRoutesOnly: true
+      VpnGatewayId: !Ref VPCVpnGateway
+
+  VPCVpnGatewayRouteProp:
+    Type: AWS::EC2::VPNGatewayRoutePropagation
+    Properties:
+      RouteTableIds:
+        - !Ref RouteTableId
+      VpnGatewayId: !Ref VPCVpnGateway
+    DependsOn: VPCVpnGatewayAttachment
+  
+  VPCConnectionRoutePrimary:
+    Type: AWS::EC2::VPNConnectionRoute
+    Properties:
+      DestinationCidrBlock: !Ref CIDRBlockDestination
+      VpnConnectionId: !Ref VPCVpnConnectionPrimary
